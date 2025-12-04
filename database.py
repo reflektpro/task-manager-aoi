@@ -115,9 +115,11 @@ def get_all_tasks(filters=None, limit=100, offset=0):
     """Получить все задачи с фильтрами"""
     with get_db() as cursor:
         query = '''
-        SELECT t.*, 
-               u1.username as author_name,
-               u2.username as executor_name
+        SELECT 
+            t.id, t.title, t.description, t.status, t.priority, t.due_date,
+            t.author_id, t.executor_id, t.created_at, t.updated_at,
+            u1.username as author_name,
+            u2.username as executor_name
         FROM tasks t
         LEFT JOIN users u1 ON t.author_id = u1.id
         LEFT JOIN users u2 ON t.executor_id = u2.id
@@ -165,9 +167,11 @@ def get_task_by_id(task_id):
     """Получить задачу по ID"""
     with get_db() as cursor:
         cursor.execute('''
-        SELECT t.*, 
-               u1.username as author_name,
-               u2.username as executor_name
+        SELECT 
+            t.id, t.title, t.description, t.status, t.priority, t.due_date,
+            t.author_id, t.executor_id, t.created_at, t.updated_at,
+            u1.username as author_name,
+            u2.username as executor_name
         FROM tasks t
         LEFT JOIN users u1 ON t.author_id = u1.id
         LEFT JOIN users u2 ON t.executor_id = u2.id
