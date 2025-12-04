@@ -1,0 +1,299 @@
+# database.py
+import sqlite3
+from contextlib import contextmanager
+
+DATABASE = 'task_manager.db'
+
+# ===== СОЗДАНИЕ ТАБЛИЦ =====
+def init_db():
+    """Создаёт все таблицы если их нет"""
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    # Таблица пользователей
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT UNIQUE NOT NULL,
+        username TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        role TEXT DEFAULT 'user' CHECK(role IN ('user', 'admin', 'super_admin'))
+    )
+    ''')
+    
+    # Таблица задач
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        description TEXT,
+        status TEXT DEFAULT 'к выполнению' 
+            CHECK(status IN ('к выполнению', 'в процессе', 'выполнена', 'отменена')),
+        priority TEXT DEFAULT 'средний' 
+            CHECK(priority IN ('низкий', 'средний', 'высокий')),
+        due_date TEXT,
+        author_id INTEGER NOT NULL,
+        executor_id INTEGER,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (author_id) REFERENCES users(id),
+        FOREIGN KEY (executor_id) REFERENCES users(id)
+    )
+    ''')
+    
+    # Таблица комментариев
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS comments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER NOT NULL,
+        author_id INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+        FOREIGN KEY (author_id) REFERENCES users(id)
+    )
+    ''')
+    
+    conn.commit()
+    conn.close()
+    print(f"✅ База данных создана: {DATABASE}")
+
+# ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
+@contextmanager
+def get_db():
+    """Контекстный менеджер для работы с БД"""
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row  # Возвращает словари вместо кортежей
+    try:
+        yield conn.cursor()
+        conn.commit()
+    finally:
+        conn.close()
+
+def dict_from_row(row):
+    """Преобразует sqlite3.Row в словарь"""
+    return dict(row) if row else None
+
+# ===== ФУНКЦИИ ДЛЯ USERS =====
+def get_all_users():
+    """Получить всех пользователей"""
+    with get_db() as cursor:
+        cursor.execute("SELECT id, email, username, created_at, role FROM users")
+        return [dict_from_row(row) for row in cursor.fetchall()]
+
+def get_user_by_id(user_id):
+    """Получить пользователя по ID"""
+    with get_db() as cursor:
+        cursor.execute(
+            "SELECT id, email, username, created_at, role FROM users WHERE id = ?",
+            (user_id,)
+        )
+        return dict_from_row(cursor.fetchone())
+
+def get_user_by_email(email):
+    """Получить пользователя по email"""
+    with get_db() as cursor:
+        cursor.execute("SELECT * FROM users WHERE email = ?", (email,))
+        return dict_from_row(cursor.fetchone())
+
+def create_user(email, username, password_hash, role='user'):
+    """Создать нового пользователя"""
+    with get_db() as cursor:
+        try:
+            cursor.execute(
+                """INSERT INTO users (email, username, password_hash, role) 
+                   VALUES (?, ?, ?, ?)""",
+                (email, username, password_hash, role)
+            )
+            return cursor.lastrowid
+        except sqlite3.IntegrityError:
+            return None
+
+# ===== ФУНКЦИИ ДЛЯ TASKS =====
+def get_all_tasks(filters=None, limit=100, offset=0):
+    """Получить все задачи с фильтрами"""
+    with get_db() as cursor:
+        query = '''
+        SELECT t.*, 
+               u1.username as author_name,
+               u2.username as executor_name
+        FROM tasks t
+        LEFT JOIN users u1 ON t.author_id = u1.id
+        LEFT JOIN users u2 ON t.executor_id = u2.id
+        WHERE 1=1
+        '''
+        params = []
+        
+        if filters:
+            # Фильтр по статусу
+            if 'status' in filters:
+                query += " AND t.status = ?"
+                params.append(filters['status'])
+            
+            # Фильтр по приоритету
+            if 'priority' in filters:
+                query += " AND t.priority = ?"
+                params.append(filters['priority'])
+            
+            # Фильтр по автору
+            if 'author_id' in filters:
+                query += " AND t.author_id = ?"
+                params.append(filters['author_id'])
+            
+            # Фильтр по исполнителю
+            if 'executor_id' in filters:
+                query += " AND t.executor_id = ?"
+                params.append(filters['executor_id'])
+            
+            # Фильтр по сроку выполнения
+            if 'due_date_before' in filters:
+                query += " AND t.due_date <= ?"
+                params.append(filters['due_date_before'])
+            
+            if 'due_date_after' in filters:
+                query += " AND t.due_date >= ?"
+                params.append(filters['due_date_after'])
+        
+        query += " ORDER BY t.created_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        
+        cursor.execute(query, params)
+        return [dict_from_row(row) for row in cursor.fetchall()]
+
+def get_task_by_id(task_id):
+    """Получить задачу по ID"""
+    with get_db() as cursor:
+        cursor.execute('''
+        SELECT t.*, 
+               u1.username as author_name,
+               u2.username as executor_name
+        FROM tasks t
+        LEFT JOIN users u1 ON t.author_id = u1.id
+        LEFT JOIN users u2 ON t.executor_id = u2.id
+        WHERE t.id = ?
+        ''', (task_id,))
+        return dict_from_row(cursor.fetchone())
+
+def create_task(title, description, author_id, executor_id=None, 
+                status='к выполнению', priority='средний', due_date=None):
+    """Создать новую задачу"""
+    with get_db() as cursor:
+        cursor.execute('''
+        INSERT INTO tasks 
+        (title, description, status, priority, due_date, author_id, executor_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (title, description, status, priority, due_date, author_id, executor_id))
+        return cursor.lastrowid
+
+def update_task(task_id, **kwargs):
+    """Обновить задачу"""
+    if not kwargs:
+        return False
+    
+    allowed_fields = ['title', 'description', 'status', 'priority', 'due_date', 'executor_id']
+    updates = []
+    params = []
+    
+    for field, value in kwargs.items():
+        if field in allowed_fields and value is not None:
+            updates.append(f"{field} = ?")
+            params.append(value)
+    
+    if not updates:
+        return False
+    
+    params.append(task_id)
+    
+    with get_db() as cursor:
+        cursor.execute(
+            f"UPDATE tasks SET {', '.join(updates)}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            params
+        )
+        return cursor.rowcount > 0
+
+def delete_task(task_id):
+    """Удалить задачу"""
+    with get_db() as cursor:
+        cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        return cursor.rowcount > 0
+
+# ===== ФУНКЦИИ ДЛЯ COMMENTS =====
+def get_comments_by_task(task_id):
+    """Получить комментарии к задаче"""
+    with get_db() as cursor:
+        cursor.execute('''
+        SELECT c.*, u.username as author_name
+        FROM comments c
+        JOIN users u ON c.author_id = u.id
+        WHERE c.task_id = ?
+        ORDER BY c.created_at
+        ''', (task_id,))
+        return [dict_from_row(row) for row in cursor.fetchall()]
+
+def add_comment(task_id, author_id, text):
+    """Добавить комментарий к задаче"""
+    with get_db() as cursor:
+        cursor.execute(
+            "INSERT INTO comments (task_id, author_id, text) VALUES (?, ?, ?)",
+            (task_id, author_id, text)
+        )
+        return cursor.lastrowid
+
+# ===== ИНИЦИАЛИЗАЦИЯ =====
+def add_test_data():
+    """Добавить тестовые данные"""
+    with get_db() as cursor:
+        # Проверяем, есть ли уже данные
+        cursor.execute("SELECT COUNT(*) FROM users")
+        if cursor.fetchone()[0] > 0:
+            print("✅ Тестовые данные уже существуют")
+            return
+        
+        # Тестовые пользователи (пароль: 123456)
+        users = [
+            ('super@mail.ru', 'Супер Админ', 'super_admin'),
+            ('admin@mail.ru', 'Администратор', 'admin'),
+            ('ivan@mail.ru', 'Иван Петров', 'user'),
+            ('anna@mail.ru', 'Анна Сидорова', 'user')
+        ]
+        
+        for email, username, role in users:
+            cursor.execute(
+                """INSERT INTO users (email, username, password_hash, role) 
+                   VALUES (?, ?, ?, ?)""",
+                (email, username, '123456', role)  # В реальности здесь должен быть хэш
+            )
+        
+        # Тестовые задачи
+        tasks = [
+            ('Настроить сервер', 'Установить и настроить веб-сервер', 2, 3, 'в процессе', 'высокий', '2024-12-10'),
+            ('Создать API', 'Написать REST API endpoints', 1, 4, 'к выполнению', 'средний', '2024-12-15'),
+            ('Тестирование', 'Протестировать функционал', 2, 3, 'к выполнению', 'низкий', None),
+        ]
+        
+        for title, desc, author, executor, status, priority, due_date in tasks:
+            cursor.execute('''
+            INSERT INTO tasks 
+            (title, description, author_id, executor_id, status, priority, due_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (title, desc, author, executor, status, priority, due_date))
+        
+        # Тестовые комментарии
+        comments = [
+            (1, 1, 'Сервер нужно настроить до конца недели'),
+            (1, 3, 'Какая версия Ubuntu ставим?'),
+            (2, 1, 'API должно быть RESTful'),
+        ]
+        
+        for task_id, author_id, text in comments:
+            cursor.execute(
+                "INSERT INTO comments (task_id, author_id, text) VALUES (?, ?, ?)",
+                (task_id, author_id, text)
+            )
+        
+        print("✅ Тестовые данные добавлены")
+
+# При импорте инициализируем БД
+init_db()
+add_test_data()
