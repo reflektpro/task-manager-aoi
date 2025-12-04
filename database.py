@@ -243,6 +243,29 @@ def add_comment(task_id, author_id, text):
             (task_id, author_id, text)
         )
         return cursor.lastrowid
+    
+def get_comment_by_id(comment_id):
+    """Получить комментарий по ID"""
+    with get_db() as cursor:
+        cursor.execute("""
+            SELECT c.id, c.task_id, c.author_id, c.text, c.created_at,
+                   u.username AS author_name
+            FROM comments c
+            JOIN users u ON c.author_id = u.id
+            WHERE c.id = ?
+        """, (comment_id,))
+        return dict_from_row(cursor.fetchone())
+
+
+def update_comment(comment_id, text):
+    """Обновить текст комментария"""
+    with get_db() as cursor:
+        cursor.execute(
+            "UPDATE comments SET text = ? WHERE id = ?",
+            (text, comment_id)
+        )
+        return cursor.rowcount > 0
+
 
 # ===== ИНИЦИАЛИЗАЦИЯ =====
 def add_test_data():

@@ -30,6 +30,7 @@ def validate_task_data(data, require_all=False):
     return errors
 
 app = Flask(__name__)
+app.config["JSON_AS_ASCII"] = False
 
 # ===== ОБРАБОТЧИКИ ОШИБОК =====
 @app.errorhandler(404)
@@ -273,35 +274,51 @@ def create_task():
 @app.route('/api/tasks/<int:task_id>', methods=['PUT'])
 def update_task(task_id):
     """Обновить задачу"""
-    data = request.json
-    
+    data = request.get_json(silent=True) or {}
+
     if not data:
         return jsonify({"error": "Необходимы данные для обновления"}), 400
-    
+
     # Проверяем существует ли задача
     task = database.get_task_by_id(task_id)
     if not task:
         return jsonify({"error": "Задача не найдена"}), 404
-    
-    # Валидация данных
-    errors = validate_task_data(data, require_all=False)
+
+    # Разрешённые к обновлению поля (синхронно с database.update_task)
+    allowed_fields = ['title', 'description', 'status', 'priority', 'due_date', 'executor_id']
+
+    # Оставляем только разрешённые поля
+    filtered_data = {
+        key: value
+        for key, value in data.items()
+        if key in allowed_fields
+    }
+
+    if not filtered_data:
+        return jsonify({
+            "error": "Нет допустимых полей для обновления",
+            "allowed_fields": allowed_fields
+        }), 400
+
+    # Валидация (сейчас у тебя заглушка, но оставляем на будущее)
+    errors = validate_task_data(filtered_data, require_all=False)
     if errors:
         return jsonify({"error": "Ошибки валидации", "details": errors}), 400
-    
+
     # Обновляем задачу
-    success = database.update_task(task_id, **data)
-    
+    success = database.update_task(task_id, **filtered_data)
+
     if not success:
         return jsonify({"error": "Не удалось обновить задачу"}), 400
-    
+
     # Получаем обновлённую задачу
     updated_task = database.get_task_by_id(task_id)
-    
+
     return jsonify({
         "success": True,
         "message": "Задача обновлена",
         "task": updated_task
-    })
+    }), 200
 
 # ===== КОММЕНТАРИИ =====
 @app.route('/api/tasks/<int:task_id>/comments', methods=['GET'])
@@ -420,6 +437,37 @@ def delete_comment(comment_id):
         
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
+@app.route('/api/comments/<int:comment_id>', methods=['PUT'])
+def update_comment(comment_id):
+    """Обновить комментарий"""
+    data = request.get_json(silent=True) or {}
+
+    text = data.get("text")
+    if not text or not str(text).strip():
+        return jsonify({"error": "Нужно непустое поле 'text'"}), 400
+
+    text = str(text).strip()
+
+    # Проверяем, что комментарий существует
+    comment = database.get_comment_by_id(comment_id)
+    if not comment:
+        return jsonify({"error": "Комментарий не найден"}), 404
+
+    # Обновляем
+    success = database.update_comment(comment_id, text)
+    if not success:
+        return jsonify({"error": "Не удалось обновить комментарий"}), 400
+
+    # Берём обновлённый комментарий
+    updated = database.get_comment_by_id(comment_id)
+
+    return jsonify({
+        "success": True,
+        "message": "Комментарий обновлён",
+        "comment": updated
+    }), 200
+
     
 
 # ===== АУТЕНТИФИКАЦИЯ =====
