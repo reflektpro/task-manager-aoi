@@ -1,9 +1,14 @@
 # app.py
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, g
+import json
 import database
 from utils.validators import validate_email, validate_username, validate_task_data
+from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
+
 
 app = Flask(__name__)
+app.config["SECRET_KEY"] = "very-secret-key-change-me"  # потом можешь вынести в env
 app.config["JSON_AS_ASCII"] = False  # чтобы JSON отдавался с нормальной кириллицей
 
 # ===== ОБРАБОТЧИКИ ОШИБОК =====
@@ -21,11 +26,34 @@ def bad_request(error):
 def internal_error(error):
     return jsonify({"error": "Внутренняя ошибка сервера"}), 500
 
+# ========== ТОКЕНЫ =================
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth_header = request.headers.get("Authorization", "")
+        parts = auth_header.split()
+
+        if len(parts) != 2 or parts[0].lower() != "bearer":
+            return jsonify({"error": "Требуется токен авторизации (Authorization: Bearer <token>)"}), 401
+
+        token = parts[1]
+
+        user = database.get_user_by_token(token)
+        if not user:
+            return jsonify({"error": "Недействительный или истёкший токен"}), 401
+
+        g.current_user = user
+        return f(*args, **kwargs)
+    return decorated
+
+
+
+
 
 # ===== ГЛАВНАЯ СТРАНИЦА =====
 @app.route('/')
 def home():
-    return jsonify({
+    payload = {
         "project": "Task Manager API",
         "version": "1.0",
         "endpoints": {
@@ -42,9 +70,19 @@ def home():
             "comments": {
                 "GET /api/tasks/<id>/comments": "Комментарии к задаче",
                 "POST /api/tasks/<id>/comments": "Добавить комментарий"
+            },
+            "auth": {
+                "POST /auth/register": "Регистрация нового пользователя",
+                "POST /auth/login": "Авторизация (возвращает токен-заглушку)"
             }
         }
-    })
+    }
+
+    return Response(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        mimetype="application/json"
+    )
+
 
 
 # ===== ПОЛЬЗОВАТЕЛИ =====
@@ -356,61 +394,162 @@ def delete_comment(comment_id):
 # ===== АУТЕНТИФИКАЦИЯ (ПОКА ЗАГЛУШКА) =====
 @app.route('/auth/login', methods=['POST'])
 def login():
-    """Простая авторизация (заглушка)"""
+    """Авторизация по email и паролю с выдачей токена из БД."""
     data = request.get_json(silent=True) or {}
 
-    email = data.get('email', '')
-    password = data.get('password', '')
+    email = (data.get('email') or '').strip()
+    password = data.get('password') or ''
 
-    if email == 'admin@mail.ru' and password == '123456':
+    if not email or not password:
         return jsonify({
-            "success": True,
-            "message": "Авторизация успешна",
-            "user": {
-                "id": 1,
-                "email": "admin@mail.ru",
-                "username": "Администратор",
-                "role": "admin"
-            },
-            "token": "fake-jwt-token-for-test"
-        })
-    else:
+            "success": False,
+            "error": "Нужны email и password"
+        }), 400
+
+    user = database.get_user_by_email(email)
+    if not user:
         return jsonify({
             "success": False,
             "error": "Неверный email или пароль"
         }), 401
 
+    if not check_password_hash(user["password_hash"], password):
+        return jsonify({
+            "success": False,
+            "error": "Неверный email или пароль"
+        }), 401
 
-@app.route('/users/me', methods=['GET'])
-def get_current_user():
-    """Профиль текущего пользователя (пока захардкожен)"""
+    user_public = {
+        "id": user["id"],
+        "email": user["email"],
+        "username": user["username"],
+        "role": user["role"],
+    }
+
+    access_token = database.create_token(user["id"])
+
     return jsonify({
         "success": True,
+        "message": "Авторизация успешна",
+        "user": user_public,
+        "token": access_token
+    }), 200
+
+
+    
+
+@app.route('/auth/register', methods=['POST'])
+def register():
+    """Регистрация нового пользователя"""
+    data = request.get_json(silent=True) or {}
+
+    email = (data.get('email') or '').strip()
+    username = (data.get('username') or '').strip()
+    password = data.get('password') or ''
+    role = data.get('role') or 'user'  # по умолчанию обычный пользователь
+
+    errors = []
+
+    # Валидация email и username через наши валидаторы
+    for err in validate_email(email):
+        errors.append(f"Email: {err}")
+    for err in validate_username(username):
+        errors.append(f"Username: {err}")
+
+    # Простая проверка пароля
+    if len(password) < 6:
+        errors.append("Пароль должен быть не короче 6 символов")
+
+    # Роль (на всякий случай)
+    if role not in ('user', 'admin', 'super_admin'):
+        errors.append("Недопустимая роль пользователя")
+
+    if errors:
+        return jsonify({
+            "error": "Ошибки валидации",
+            "details": errors
+        }), 400
+
+    # Проверяем, нет ли уже такого email
+    existing = database.get_user_by_email(email)
+    if existing:
+        return jsonify({
+            "error": "Пользователь с таким email уже существует"
+        }), 400
+
+    # Хэшируем пароль
+    password_hash = generate_password_hash(password)
+
+    # Пишем в БД
+    user_id = database.create_user(email, username, password_hash, role=role)
+    if not user_id:
+        return jsonify({"error": "Не удалось создать пользователя"}), 500
+
+    return jsonify({
+        "success": True,
+        "message": "Пользователь зарегистрирован",
         "user": {
-            "id": 1,
-            "email": "admin@mail.ru",
-            "username": "Администратор",
-            "role": "admin",
-            "created_at": "2025-12-04 13:42:49"
+            "id": user_id,
+            "email": email,
+            "username": username,
+            "role": role
         }
-    })
+    }), 201
+
+
+
+@app.route('/users/me', methods=['GET'])
+@token_required
+def get_current_user():
+    """Профиль текущего пользователя на основе токена."""
+    user = g.current_user
+    return jsonify({
+        "success": True,
+        "user": user
+    }), 200
+
 
 
 @app.route('/users/me', methods=['PUT'])
+@token_required
 def update_current_user():
-    """Обновление профиля (заглушка)"""
+    """Обновление профиля (пока только username, без записи в БД)."""
     data = request.get_json(silent=True) or {}
 
     if 'username' not in data:
         return jsonify({"error": "Нужно поле 'username'"}), 400
 
+    new_username = (data['username'] or "").strip()
+    if not new_username:
+        return jsonify({"error": "Имя пользователя не может быть пустым"}), 400
+
     return jsonify({
         "success": True,
         "message": "Профиль обновлён",
         "updated": {
-            "username": data['username']
+            "username": new_username
         }
-    })
+    }), 200
+
+
+@app.route('/auth/refresh', methods=['POST'])
+def refresh_token():
+    """Обновить токен авторизации: старый инвалидируется, выдаётся новый."""
+    data = request.get_json(silent=True) or {}
+    old_token = (data.get("token") or "").strip()
+
+    if not old_token:
+        return jsonify({"error": "Нужен токен для обновления"}), 400
+
+    new_token = database.refresh_token(old_token)
+    if not new_token:
+        return jsonify({"error": "Токен недействителен или истёк"}), 401
+
+    return jsonify({
+        "success": True,
+        "token": new_token
+    }), 200
+
 
 
 # ===== ЗАПУСК СЕРВЕРА =====

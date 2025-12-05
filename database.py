@@ -1,6 +1,9 @@
 # database.py
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timedelta
+import secrets
+from werkzeug.security import generate_password_hash  # для тестовых пользователей
 
 DATABASE = 'task_manager.db'
 
@@ -52,6 +55,17 @@ def init_db():
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
         FOREIGN KEY (author_id) REFERENCES users(id)
+    )
+    ''')
+
+    # Таблица токенов авторизации
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS auth_tokens (
+        token TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        expires_at TEXT NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     )
     ''')
     
@@ -289,8 +303,10 @@ def add_test_data():
             cursor.execute(
                 """INSERT INTO users (email, username, password_hash, role) 
                    VALUES (?, ?, ?, ?)""",
-                (email, username, '123456', role)  # В реальности здесь должен быть хэш
+                (email, username, generate_password_hash("123456"), role)
             )
+
+
         
         # Тестовые задачи
         tasks = [
@@ -320,6 +336,64 @@ def add_test_data():
             )
         
         print("✅ Тестовые данные добавлены")
+
+# ===== ФУНКЦИИ ДЛЯ ТОКЕНОВ АВТОРИЗАЦИИ =====
+
+def create_token(user_id: int, expires_in: int = 3600) -> str:
+    """Создать новый токен авторизации для пользователя."""
+    token = secrets.token_urlsafe(32)
+    expires_at = (datetime.utcnow() + timedelta(seconds=expires_in)).strftime("%Y-%m-%d %H:%M:%S")
+
+    with get_db() as cursor:
+        cursor.execute(
+            "INSERT INTO auth_tokens (token, user_id, expires_at) VALUES (?, ?, ?)",
+            (token, user_id, expires_at)
+        )
+
+    return token
+
+
+def get_user_by_token(token: str):
+    """Получить пользователя по токену, если токен ещё не истёк."""
+    with get_db() as cursor:
+        cursor.execute('''
+        SELECT 
+            u.id, u.email, u.username, u.created_at, u.role
+        FROM auth_tokens t
+        JOIN users u ON t.user_id = u.id
+        WHERE t.token = ?
+          AND t.expires_at > CURRENT_TIMESTAMP
+        ''', (token,))
+        row = cursor.fetchone()
+        return dict_from_row(row)
+
+
+def refresh_token(old_token: str, expires_in: int = 3600):
+    """Обновить токен: старый инвалидируем, создаём новый."""
+    with get_db() as cursor:
+        cursor.execute('''
+        SELECT user_id FROM auth_tokens
+        WHERE token = ? AND expires_at > CURRENT_TIMESTAMP
+        ''', (old_token,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+
+        user_id = row["user_id"]
+
+        # Удаляем старый токен
+        cursor.execute("DELETE FROM auth_tokens WHERE token = ?", (old_token,))
+
+        # Создаём новый
+        new_token = secrets.token_urlsafe(32)
+        expires_at = (datetime.utcnow() + timedelta(seconds=expires_in)).strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute(
+            "INSERT INTO auth_tokens (token, user_id, expires_at) VALUES (?, ?, ?)",
+            (new_token, user_id, expires_at)
+        )
+
+        return new_token
+
 
 # При импорте инициализируем БД
 init_db()

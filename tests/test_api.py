@@ -8,10 +8,19 @@ from app import app
 
 @pytest.fixture
 def client():
-    """Тестовый клиент Flask"""
     app.config["TESTING"] = True
     with app.test_client() as client:
         yield client
+
+@pytest.fixture
+def auth_token(client):
+    resp = client.post("/auth/login", json={
+        "email": "admin@mail.ru",
+        "password": "123456"
+    })
+    assert resp.status_code == 200
+    data = resp.get_json()
+    return data["token"]
 
 
 # ===== БАЗОВЫЕ ТЕСТЫ =====
@@ -194,18 +203,30 @@ def test_login_fail(client):
     assert data["success"] is False
 
 
-def test_get_me(client):
-    resp = client.get("/users/me")
+def test_get_me(client, auth_token):
+    resp = client.get(
+        "/users/me",
+        headers={"Authorization": f"Bearer {auth_token}"}
+    )
     assert resp.status_code == 200
     data = resp.get_json()
     assert data["success"] is True
     assert data["user"]["email"] == "admin@mail.ru"
 
 
-def test_update_me(client):
+def test_update_me(client, auth_token):
     payload = {"username": "Новый Админ"}
-    resp = client.put("/users/me", json=payload)
+    resp = client.put(
+        "/users/me",
+        json=payload,
+        headers={"Authorization": f"Bearer {auth_token}"}
+    )
     assert resp.status_code == 200
     data = resp.get_json()
     assert data["success"] is True
     assert data["updated"]["username"] == "Новый Админ"
+
+
+
+
+
