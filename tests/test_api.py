@@ -226,6 +226,68 @@ def test_update_me(client, auth_token):
     assert data["success"] is True
     assert data["updated"]["username"] == "Новый Админ"
 
+def test_refresh_token_success(client, auth_token):
+    # Обновляем токен
+    resp = client.post("/auth/refresh", json={"token": auth_token})
+    assert resp.status_code == 200
+
+    data = resp.get_json()
+    assert data["success"] is True
+    assert "token" in data
+
+    new_token = data["token"]
+    assert new_token != auth_token  # на всякий случай
+
+    # Новый токен должен работать
+    resp2 = client.get(
+        "/users/me",
+        headers={"Authorization": f"Bearer {new_token}"}
+    )
+    assert resp2.status_code == 200
+    data2 = resp2.get_json()
+    assert data2["success"] is True
+    assert data2["user"]["email"] == "admin@mail.ru"
+
+    # Старый токен больше не должен работать
+    resp3 = client.get(
+        "/users/me",
+        headers={"Authorization": f"Bearer {auth_token}"}
+    )
+    assert resp3.status_code == 401
+    data3 = resp3.get_json()
+    assert "error" in data3
+
+
+def test_refresh_token_invalid(client):
+    # Пытаемся обновить вообще левый токен
+    resp = client.post("/auth/refresh", json={"token": "abracadabra"})
+    assert resp.status_code == 401
+
+    data = resp.get_json()
+    assert "error" in data
+
+def test_update_comment(client, auth_token):
+    # Сначала берём любой комментарий к существующей задаче
+    resp = client.get("/api/tasks/1/comments")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["count"] > 0
+
+    comment_id = data["comments"][0]["id"]
+
+    new_text = "Обновлённый текст комментария (тестовый)"
+
+    resp2 = client.put(
+        f"/api/comments/{comment_id}",
+        json={"text": new_text},
+        headers={"Authorization": f"Bearer {auth_token}"}
+    )
+
+    assert resp2.status_code == 200
+    data2 = resp2.get_json()
+    assert data2["success"] is True
+    assert data2["comment"]["id"] == comment_id
+    assert data2["comment"]["text"] == new_text
 
 
 

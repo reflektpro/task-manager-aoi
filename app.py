@@ -389,9 +389,62 @@ def delete_comment(comment_id):
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
+def get_comment_by_id(comment_id):
+    """Получить один комментарий по ID"""
+    with get_db() as cursor:
+        cursor.execute('''
+        SELECT 
+            c.id,
+            c.task_id,
+            c.author_id,
+            c.text,
+            c.created_at,
+            u.username as author_name
+        FROM comments c
+        JOIN users u ON c.author_id = u.id
+        WHERE c.id = ?
+        ''', (comment_id,))
+        return dict_from_row(cursor.fetchone())
 
 
-# ===== АУТЕНТИФИКАЦИЯ (ПОКА ЗАГЛУШКА) =====
+@app.route('/api/comments/<int:comment_id>', methods=['PUT'])
+@token_required
+def update_comment_route(comment_id):
+    """Обновить комментарий по ID"""
+    data = request.get_json(silent=True) or {}
+    new_text = (data.get("text") or "").strip()
+
+    if not new_text:
+        return jsonify({"error": "Нужно непустое поле 'text'"}), 400
+
+    # Проверяем, что комментарий существует
+    comment = database.get_comment_by_id(comment_id)
+    if not comment:
+        return jsonify({"error": "Комментарий не найден"}), 404
+
+    # Проверяем права: автор комментария или админ/суперадмин
+    user = g.current_user
+    is_admin = user.get("role") in ("admin", "super_admin")
+    if not is_admin and comment["author_id"] != user["id"]:
+        return jsonify({"error": "Недостаточно прав для редактирования комментария"}), 403
+
+    ok = database.update_comment(comment_id, new_text)
+    if not ok:
+        return jsonify({"error": "Не удалось обновить комментарий"}), 500
+
+    updated = database.get_comment_by_id(comment_id)
+
+    return jsonify({
+        "success": True,
+        "message": "Комментарий обновлён",
+        "comment": updated
+    }), 200
+
+
+
+
+# ===== АУТЕНТИФИКАЦИЯ =====
 @app.route('/auth/login', methods=['POST'])
 def login():
     """Авторизация по email и паролю с выдачей токена из БД."""
