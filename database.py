@@ -104,6 +104,43 @@ def get_user_by_id(user_id):
             (user_id,)
         )
         return dict_from_row(cursor.fetchone())
+    
+def update_user_role(user_id, new_role):
+    """Обновить роль пользователя."""
+    if new_role not in ("user", "admin", "super_admin"):
+        return False
+    with get_db() as cursor:
+        cursor.execute(
+            "UPDATE users SET role = ? WHERE id = ?",
+            (new_role, user_id)
+        )
+        return cursor.rowcount > 0
+
+def get_user_usage_counts(user_id):
+    """Вернуть количество задач и комментариев пользователя (для проверки перед удалением)."""
+    with get_db() as cursor:
+        # сколько задач он создавал/где был исполнителем
+        cursor.execute(
+            "SELECT COUNT(*) FROM tasks WHERE author_id = ? OR executor_id = ?",
+            (user_id, user_id)
+        )
+        tasks_count = cursor.fetchone()[0]
+
+        # сколько комментариев оставил
+        cursor.execute(
+            "SELECT COUNT(*) FROM comments WHERE author_id = ?",
+            (user_id,)
+        )
+        comments_count = cursor.fetchone()[0]
+
+        return {"tasks_count": tasks_count, "comments_count": comments_count}
+
+def delete_user(user_id):
+    """Удалить пользователя. ВАЖНО: перед этим нужно проверить, что у него нет задач/комментариев."""
+    with get_db() as cursor:
+        cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        return cursor.rowcount > 0
+
 
 def get_user_by_email(email):
     """Получить пользователя по email"""
@@ -123,6 +160,50 @@ def create_user(email, username, password_hash, role='user'):
             return cursor.lastrowid
         except sqlite3.IntegrityError:
             return None
+
+def get_user_by_access_token(token: str):
+    """
+    Вернуть пользователя по access-токену из таблицы auth_tokens.
+    """
+    with get_db() as cursor:
+        cursor.execute('''
+            SELECT 
+                u.id,
+                u.email,
+                u.username,
+                u.created_at,
+                u.role,
+                t.expires_at
+            FROM auth_tokens t
+            JOIN users u ON u.id = t.user_id
+            WHERE t.token = ?
+        ''', (token,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+
+        data = dict_from_row(row)
+
+        # проверка срока действия токена
+        expires_at = data.get("expires_at")
+        if expires_at:
+            try:
+                if datetime.fromisoformat(expires_at) <= datetime.utcnow():
+                    return None
+            except Exception:
+                # если формат неожиданно странный — не роняем сервер
+                pass
+
+        # нам от токена нужен только пользователь
+        return {
+            "id": data["id"],
+            "email": data["email"],
+            "username": data["username"],
+            "created_at": data["created_at"],
+            "role": data["role"],
+        }
+
+
 
 # ===== ФУНКЦИИ ДЛЯ TASKS =====
 def get_all_tasks(filters=None, limit=100, offset=0):
@@ -287,6 +368,47 @@ def update_comment(comment_id, text):
             (text, comment_id)
         )
         return cursor.rowcount > 0
+    
+def get_task_stats():
+    """Получить статистику задач по статусам и приоритетам."""
+    with get_db() as cursor:
+        stats = {
+            "by_status": {},
+            "by_priority": {},
+        }
+
+        cursor.execute("SELECT status, COUNT(*) as count FROM tasks GROUP BY status")
+        for row in cursor.fetchall():
+            stats["by_status"][row["status"]] = row["count"]
+
+        cursor.execute("SELECT priority, COUNT(*) as count FROM tasks GROUP BY priority")
+        for row in cursor.fetchall():
+            stats["by_priority"][row["priority"]] = row["count"]
+
+        return stats
+
+
+def get_active_users(limit: int = 10):
+    """Получить список активных пользователей (по задачам и комментариям)."""
+    with get_db() as cursor:
+        cursor.execute("""
+        SELECT 
+            u.id,
+            u.email,
+            u.username,
+            u.role,
+            u.created_at,
+            COUNT(DISTINCT t.id) AS tasks_count,
+            COUNT(DISTINCT c.id) AS comments_count
+        FROM users u
+        LEFT JOIN tasks t ON t.author_id = u.id
+        LEFT JOIN comments c ON c.author_id = u.id
+        GROUP BY u.id, u.email, u.username, u.role, u.created_at
+        ORDER BY tasks_count + comments_count DESC, u.id
+        LIMIT ?
+        """, (limit,))
+        return [dict_from_row(row) for row in cursor.fetchall()]
+
 
 
 

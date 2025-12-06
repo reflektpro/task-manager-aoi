@@ -1,14 +1,23 @@
 # app.py
-from flask import Flask, request, jsonify, Response, g
+from flask import Flask, request, jsonify, Response, g, render_template
 import json
 import database
 from utils.validators import validate_email, validate_username, validate_task_data
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
-
+import sqlite3
+from cache import (
+    make_task_list_cache_key,
+    get_cached_task_list,
+    set_cached_task_list,
+    get_cached_task_detail,
+    set_cached_task_detail,
+    invalidate_task_list_cache,
+    invalidate_task_detail,
+)
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = "very-secret-key-change-me"  # потом можешь вынести в env
+app.config["SECRET_KEY"] = "very-secret-key-change-me" 
 app.config["JSON_AS_ASCII"] = False  # чтобы JSON отдавался с нормальной кириллицей
 
 # ===== ОБРАБОТЧИКИ ОШИБОК =====
@@ -139,23 +148,48 @@ def get_tasks():
     except ValueError:
         return jsonify({"error": "Параметры limit и page должны быть числами"}), 400
 
+    # ----- КЭШ СПИСКА ЗАДАЧ -----
+    cache_key = make_task_list_cache_key(filters, page, limit)
+    cached = get_cached_task_list(cache_key)
+    if cached is not None:
+        # Возвращаем из кэша, структура ответа такая же
+        return jsonify({
+            "success": True,
+            "count": cached["count"],
+            "page": page,
+            "limit": limit,
+            "tasks": cached["tasks"],
+        })
+
+    # Если в кэше нет — идём в БД
     tasks = database.get_all_tasks(filters, limit, offset)
+    data_for_cache = {
+        "count": len(tasks),
+        "tasks": tasks,
+    }
+    set_cached_task_list(cache_key, data_for_cache)
 
     return jsonify({
         "success": True,
-        "count": len(tasks),
+        "count": data_for_cache["count"],
         "page": page,
         "limit": limit,
-        "tasks": tasks
+        "tasks": data_for_cache["tasks"],
     })
 
 
 @app.route('/api/tasks/<int:task_id>', methods=['GET'])
 def get_task(task_id):
-    """Получить задачу по ID"""
-    task = database.get_task_by_id(task_id)
-    if not task:
-        return jsonify({"error": "Задача не найдена"}), 404
+    """Получить задачу по ID (с кэшированием деталей)"""
+    # Пробуем взять из кэша
+    task = get_cached_task_detail(task_id)
+    if task is None:
+        # Если в кэше нет — идём в БД
+        task = database.get_task_by_id(task_id)
+        if not task:
+            return jsonify({"error": "Задача не найден"}), 404
+        # Кладём в кэш
+        set_cached_task_detail(task_id, task)
 
     return jsonify({
         "success": True,
@@ -163,14 +197,18 @@ def get_task(task_id):
     })
 
 
+
 @app.route('/api/tasks', methods=['POST'])
+@token_required
 def create_task():
-    """Создать новую задачу"""
-    import sqlite3
+    """Создать новую задачу (только для admin / super_admin)"""
+    # Проверка роли
+    user = g.current_user
+    if user.get("role") not in ("admin", "super_admin"):
+        return jsonify({"error": "Недостаточно прав для создания задач"}), 403
 
     try:
         data = request.get_json(silent=True)
-
         if data is None:
             return jsonify({"error": "Нужен JSON в теле запроса"}), 400
 
@@ -203,12 +241,16 @@ def create_task():
         if not task:
             return jsonify({"error": "Не удалось получить задачу после создания"}), 500
 
+        # Инвалидация тут
+        invalidate_task_list_cache()
+        invalidate_task_detail(task_id)
+
         return jsonify({
             "success": True,
             "message": "Задача создана",
             "task": task
         }), 201
-
+    
     except sqlite3.IntegrityError as e:
         return jsonify({"error": f"Ошибка базы данных: {str(e)}"}), 400
     except Exception as e:
@@ -251,19 +293,23 @@ def update_task(task_id):
         return jsonify({"error": "Ошибки валидации", "details": errors}), 400
 
     # Обновляем задачу
-    success = database.update_task(task_id, **filtered_data)
-
+    success = database.update_task(task_id, **data)
+    
     if not success:
         return jsonify({"error": "Не удалось обновить задачу"}), 400
 
+    # Инвалидируем кэш
+    invalidate_task_list_cache()
+    invalidate_task_detail(task_id)
+    
     # Получаем обновлённую задачу
     updated_task = database.get_task_by_id(task_id)
-
+    
     return jsonify({
         "success": True,
         "message": "Задача обновлена",
         "task": updated_task
-    }), 200
+    })
 
 
 @app.route('/api/tasks/<int:task_id>', methods=['DELETE'])
@@ -283,16 +329,20 @@ def delete_task(task_id):
         # Удаляем
         cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         conn.commit()
-
+        
         affected = cursor.rowcount
         conn.close()
 
+        if affected:
+            invalidate_task_list_cache()
+            invalidate_task_detail(task_id)
+        
         return jsonify({
             "success": True,
             "message": f"Задача #{task_id} удалена",
             "deleted": affected
         })
-
+    
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -518,6 +568,8 @@ def register():
         errors.append("Недопустимая роль пользователя")
 
     if errors:
+        print("DEBUG /auth/register data:", data)
+        print("DEBUG /auth/register errors:", errors)
         return jsonify({
             "error": "Ошибки валидации",
             "details": errors
@@ -561,6 +613,66 @@ def get_current_user():
         "user": user
     }), 200
 
+def resolve_current_user():
+    """Достаём юзера по токену из заголовка Authorization."""
+    auth_header = request.headers.get("Authorization", "")
+    
+    if not auth_header.startswith("Bearer "):
+        return None, ("Требуется авторизация", 401)
+    
+    token = auth_header.split(" ", 1)[1].strip()
+    if not token:
+        return None, ("Требуется авторизация", 401)
+    
+    user = database.get_user_by_access_token(token)
+    if not user:
+        return None, ("Неверный или истёкший токен", 401)
+    
+    return user, None
+
+def login_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        user, error = resolve_current_user()
+        if error:
+            message, code = error
+            return jsonify({"error": message}), code
+        g.current_user = user
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def admin_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        user, error = resolve_current_user()
+        if error:
+            message, code = error
+            return jsonify({"error": message}), code
+        
+        if user["role"] not in ("admin", "super_admin"):
+            return jsonify({"error": "Недостаточно прав"}), 403
+        
+        g.current_user = user
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def super_admin_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        user, error = resolve_current_user()
+        if error:
+            message, code = error
+            return jsonify({"error": message}), code
+        
+        if user["role"] != "super_admin":
+            return jsonify({"error": "Только супер-админ может выполнить это действие"}), 403
+        
+        g.current_user = user
+        return f(*args, **kwargs)
+    return wrapper
+
 
 
 @app.route('/users/me', methods=['PUT'])
@@ -584,6 +696,91 @@ def update_current_user():
         }
     }), 200
 
+# ===== АДМИН: УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ =====
+
+@app.route('/admin/stats', methods=['GET'])
+@token_required
+def admin_stats():
+    """Статистика для админ-панели (только admin / super_admin)."""
+    user = g.current_user
+    if user.get("role") not in ("admin", "super_admin"):
+        return jsonify({"error": "Недостаточно прав"}), 403
+
+    stats = database.get_task_stats()
+    active_users = database.get_active_users(limit=10)
+
+    return jsonify({
+        "success": True,
+        "stats": stats,
+        "active_users": active_users,
+    })
+
+@app.route('/admin')
+def admin_panel():
+    """
+    Простейшая админ-панель с UI.
+    Страница, которая через JS ходит в API: /auth/login, /admin/stats, /api/tasks, /api/users.
+    """
+    return render_template('admin.html')
+
+@app.route('/admin/users/<int:user_id>/role', methods=['PUT'])
+@super_admin_required
+def admin_change_user_role(user_id):
+    data = request.get_json(silent=True) or {}
+    new_role = data.get("role")
+
+    if new_role not in ("user", "admin", "super_admin"):
+        return jsonify({"error": "Недопустимая роль"}), 400
+
+    user = database.get_user_by_id(user_id)
+    if not user:
+        return jsonify({"error": "Пользователь не найден"}), 404
+
+    # нельзя менять роль самому себе с super_admin на что-то другое (по желанию)
+    if g.current_user["id"] == user_id and new_role != "super_admin":
+        return jsonify({"error": "Нельзя понизить самого себя"}), 400
+
+    with database.get_db() as cursor:
+        cursor.execute(
+            "UPDATE users SET role = ? WHERE id = ?",
+            (new_role, user_id)
+        )
+        if cursor.rowcount == 0:
+            return jsonify({"error": "Не удалось обновить роль"}), 500
+
+    return jsonify({
+        "success": True,
+        "user_id": user_id,
+        "new_role": new_role
+    })
+
+@app.route('/admin/users/<int:user_id>', methods=['DELETE'])
+@super_admin_required
+def admin_delete_user(user_id):
+    # нельзя удалить сам себя
+    if g.current_user["id"] == user_id:
+        return jsonify({"error": "Нельзя удалить самого себя"}), 400
+
+    user = database.get_user_by_id(user_id)
+    if not user:
+        return jsonify({"error": "Пользователь не найден"}), 404
+
+    try:
+        deleted = database.delete_user(user_id)
+    except Exception as e:
+        # сюда может прилететь FOREIGN KEY constraint failed
+        return jsonify({
+            "error": "Не удалось удалить пользователя",
+            "details": str(e)
+        }), 400
+
+    if not deleted:
+        return jsonify({"error": "Пользователь не был удалён"}), 500
+
+    return jsonify({
+        "success": True,
+        "deleted_id": user_id
+    })
 
 @app.route('/auth/refresh', methods=['POST'])
 def refresh_token():
@@ -624,5 +821,5 @@ if __name__ == '__main__':
     print("  GET  /api/tasks/<id>/comments  - комментарии к задаче")
     print("  POST /api/tasks/<id>/comments  - добавить комментарий")
     print("=" * 70)
-
+    
     app.run(debug=True, port=5000)

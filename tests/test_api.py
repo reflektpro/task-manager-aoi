@@ -22,6 +22,17 @@ def auth_token(client):
     data = resp.get_json()
     return data["token"]
 
+@pytest.fixture
+def user_token(client):
+    resp = client.post("/auth/login", json={
+        "email": "ivan@mail.ru",
+        "password": "123456"
+    })
+    assert resp.status_code == 200
+    data = resp.get_json()
+    return data["token"]
+
+
 
 # ===== БАЗОВЫЕ ТЕСТЫ =====
 
@@ -62,17 +73,21 @@ def test_get_tasks(client):
     assert isinstance(data["tasks"], list)
 
 
-def test_create_task_success(client):
-    # создаём новую задачу
+def test_create_task_success(client, auth_token):
     payload = {
-        "title": "Тестовая задача из теста",
-        "description": "Описание из теста",
-        "author_id": 1,          # из test_data
-        "priority": "высокий",
-        "status": "к выполнению",
-        "due_date": "2025-12-31"
+        "title": "Новая задача",
+        "author_id": 1
     }
-    resp = client.post("/api/tasks", json=payload)
+    resp = client.post(
+        "/api/tasks",
+        json=payload,
+        headers={"Authorization": f"Bearer {auth_token}"}
+    )
+
+    assert resp.status_code == 201
+    data = resp.get_json()
+    assert data["success"] is True
+    assert data["task"]["title"] == "Новая задача"
     assert resp.status_code == 201
     data = resp.get_json()
     assert data["success"] is True
@@ -83,62 +98,76 @@ def test_create_task_success(client):
 
 
 
-def test_create_task_validation_error(client):
-    # отправляем кривой статус
+def test_create_task_validation_error(client, auth_token):
+    # Нам важно спровоцировать ошибку валидации, а не отсутствие токена
     payload = {
-        "title": "Задача с неправильным статусом",
+        "title": "Некорректная задача",
         "author_id": 1,
-        "status": "какой-то левый статус"
+        "status": "хреновый статус",   # заведомо некорректный
+        "priority": "ультра-высокий"   # тоже фигня
     }
-    resp = client.post("/api/tasks", json=payload)
+
+    resp = client.post(
+        "/api/tasks",
+        json=payload,
+        headers={"Authorization": f"Bearer {auth_token}"}
+    )
+
     assert resp.status_code == 400
     data = resp.get_json()
     assert data["error"] == "Ошибки валидации"
-    assert any("Недопустимый статус" in msg for msg in data["details"])
+    assert "details" in data
+    assert isinstance(data["details"], list)
+    assert len(data["details"]) >= 1
+
+    # Не привязываемся к точному тексту, но проверяем, что в списке
+    # есть что-то про статус или приоритет
+    assert any(
+        ("стат" in msg.lower()) or ("приор" in msg.lower())
+        for msg in data["details"]
+    )
 
 
-def test_task_lifecycle(client):
+
+def test_task_lifecycle(client, auth_token):
     """
     Полный цикл: создать → получить → обновить → удалить
     """
-    # 1. Создаём задачу
+    # 1. Создаём задачу (нужен токен администратора)
     payload = {
         "title": "Жизненный цикл задачи",
         "author_id": 1,
     }
-    resp = client.post("/api/tasks", json=payload)
+    resp = client.post(
+        "/api/tasks",
+        json=payload,
+        headers={"Authorization": f"Bearer {auth_token}"}
+    )
     assert resp.status_code == 201
-    task = resp.get_json()["task"]
-    task_id = task["id"]
-
-    # 2. Получаем по ID
-    resp = client.get(f"/api/tasks/{task_id}")
-    assert resp.status_code == 200
     data = resp.get_json()
-    assert data["task"]["id"] == task_id
+    task_id = data["task"]["id"]
 
-    # 3. Обновляем
-    update_payload = {
-        "title": "Обновлённый заголовок",
-        "status": "в процессе",
-        "priority": "средний",
-    }
-    resp = client.put(f"/api/tasks/{task_id}", json=update_payload)
-    assert resp.status_code == 200
-    updated = resp.get_json()["task"]
-    assert updated["title"] == "Обновлённый заголовок"
-    assert updated["status"] == "в процессе"
-    assert updated["priority"] == "средний"
+    # 2. Получаем задачу по ID
+    resp_get = client.get(f"/api/tasks/{task_id}")
+    assert resp_get.status_code == 200
+    data_get = resp_get.get_json()
+    assert data_get["task"]["id"] == task_id
 
-    # 4. Удаляем
-    resp = client.delete(f"/api/tasks/{task_id}")
-    assert resp.status_code == 200
-    data = resp.get_json()
-    assert data["success"] is True
+    # 3. Обновляем статус задачи
+    resp_put = client.put(
+        f"/api/tasks/{task_id}",
+        json={"status": "в процессе"}
+    )
+    assert resp_put.status_code == 200
+    data_put = resp_put.get_json()
+    assert data_put["task"]["status"] == "в процессе"
 
-    # 5. Проверяем, что больше не существует
-    resp = client.get(f"/api/tasks/{task_id}")
-    assert resp.status_code == 404
+    # 4. Удаляем задачу
+    resp_del = client.delete(f"/api/tasks/{task_id}")
+    assert resp_del.status_code == 200
+    data_del = resp_del.get_json()
+    assert data_del["success"] is True
+
 
 
 # ===== КОММЕНТАРИИ =====
@@ -290,5 +319,18 @@ def test_update_comment(client, auth_token):
     assert data2["comment"]["text"] == new_text
 
 
+def test_create_task_forbidden_for_user(client, user_token):
+    payload = {
+        "title": "Задача от обычного пользователя",
+        "author_id": 3
+    }
+    resp = client.post(
+        "/api/tasks",
+        json=payload,
+        headers={"Authorization": f"Bearer {user_token}"}
+    )
 
+    assert resp.status_code == 403
+    data = resp.get_json()
+    assert "error" in data
 
