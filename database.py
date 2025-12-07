@@ -198,7 +198,27 @@ def delete_all_tokens_for_user(user_id: int) -> int:
         cursor.execute("DELETE FROM auth_tokens WHERE user_id = ?", (user_id,))
         return cursor.rowcount
 
+def update_user_basic(user_id, fields: dict):
+    if not fields:
+        return get_user_by_id(user_id)
 
+    sets = []
+    params = []
+    for key, val in fields.items():
+        sets.append(f"{key} = ?")
+        params.append(val)
+
+    params.append(user_id)
+
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            UPDATE users
+            SET {", ".join(sets)}
+            WHERE id = ?
+        """, params)
+        conn.commit()
+    return get_user_by_id(user_id)
 
 
 # ===== ФУНКЦИИ ДЛЯ TASKS =====

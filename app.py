@@ -259,10 +259,17 @@ def create_task():
 
 
 @app.route('/api/tasks/<int:task_id>', methods=['PUT'])
+@token_required
 def update_task(task_id):
     """Обновить задачу"""
-    data = request.get_json(silent=True) or {}
+    # Кто делает запрос
+    current_user, error = resolve_current_user()
+    if error:
+        return jsonify({"error": error}), 401
 
+    role = current_user["role"]
+
+    data = request.get_json(silent=True) or {}
     if not data:
         return jsonify({"error": "Необходимы данные для обновления"}), 400
 
@@ -271,10 +278,21 @@ def update_task(task_id):
     if not task:
         return jsonify({"error": "Задача не найдена"}), 404
 
-    # Разрешённые к обновлению поля — синхронно с database.update_task
+    # --- ПРОВЕРКА ПРАВ СООТВЕТСТВУЕТ ТЗ ---
+    # Обычный юзер вообще не может обновлять задачи
+    if role == "user":
+        return jsonify({"error": "Недостаточно прав"}), 403
+
+    # Админ может трогать только задачи, где он автор
+    if role == "admin" and task["author_id"] != current_user["id"]:
+        return jsonify({
+            "error": "Администратор может изменять только свои задачи"
+        }), 403
+    # super_admin проходит дальше без ограничений
+
+    # Разрешённые к обновлению поля
     allowed_fields = ['title', 'description', 'status', 'priority', 'due_date', 'executor_id']
 
-    # Оставляем только разрешённые поля
     filtered_data = {
         key: value
         for key, value in data.items()
@@ -287,64 +305,78 @@ def update_task(task_id):
             "allowed_fields": allowed_fields
         }), 400
 
-    # Валидация (без require_all, так как это частичное обновление)
+    # Частичная валидация (require_all=False)
     errors = validate_task_data(filtered_data, require_all=False)
     if errors:
         return jsonify({"error": "Ошибки валидации", "details": errors}), 400
 
-    # Обновляем задачу
-    success = database.update_task(task_id, **data)
-    
+    # ВАЖНО: в базу отправляем только отфильтрованные поля
+    success = database.update_task(task_id, **filtered_data)
     if not success:
         return jsonify({"error": "Не удалось обновить задачу"}), 400
 
     # Инвалидируем кэш
     invalidate_task_list_cache()
     invalidate_task_detail(task_id)
-    
-    # Получаем обновлённую задачу
+
     updated_task = database.get_task_by_id(task_id)
-    
+
     return jsonify({
         "success": True,
         "message": "Задача обновлена",
         "task": updated_task
-    })
+    }), 200
 
 
 @app.route('/api/tasks/<int:task_id>', methods=['DELETE'])
+@token_required
 def delete_task(task_id):
     """Удалить задачу"""
+    # Кто делает запрос
+    current_user, error = resolve_current_user()
+    if error:
+        return jsonify({"error": error}), 401
+
+    role = current_user["role"]
+
+    # Сначала найдём задачу через твой database-слой
+    task = database.get_task_by_id(task_id)
+    if not task:
+        return jsonify({"error": "Задача не найдена"}), 404
+
+    # --- ПРОВЕРКА ПРАВ ---
+    if role == "user":
+        return jsonify({"error": "Недостаточно прав"}), 403
+
+    if role == "admin" and task["author_id"] != current_user["id"]:
+        return jsonify({
+            "error": "Администратор может удалять только свои задачи"
+        }), 403
+    # super_admin снова проходит дальше
+
+    # Дальше можно оставить твой старый sqlite-код
     try:
         import sqlite3
         conn = sqlite3.connect('task_manager.db')
         cursor = conn.cursor()
 
-        # Проверяем существует ли задача
-        cursor.execute("SELECT id FROM tasks WHERE id = ?", (task_id,))
-        if not cursor.fetchone():
-            conn.close()
-            return jsonify({"error": "Задача не найдена"}), 404
-
-        # Удаляем
         cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         conn.commit()
-        
         affected = cursor.rowcount
         conn.close()
 
         if affected:
             invalidate_task_list_cache()
             invalidate_task_detail(task_id)
-        
+
         return jsonify({
             "success": True,
             "message": f"Задача #{task_id} удалена",
             "deleted": affected
-        })
-    
+        }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 
 # ===== КОММЕНТАРИИ =====
@@ -660,7 +692,7 @@ def auth_required(fn):
 
 def admin_required(fn):
     """Декоратор: нужен admin или super_admin."""
-    from functools import wraps
+
 
     @wraps(fn)
     @auth_required
@@ -824,6 +856,18 @@ def admin_delete_user(user_id):
         "success": True,
         "deleted_id": user_id
     })
+
+@app.route("/admin/users/<int:user_id>", methods=["PUT"])
+@token_required
+def admin_update_user(user_id):
+    current_user, error = resolve_current_user()
+    if error:
+        return jsonify({"error": error}), 401
+
+    if current_user["role"] != "super_admin":
+        return jsonify({
+            "error": "Только супер-админ может выполнить это действие"
+        }), 403
 
 @app.route('/auth/refresh', methods=['POST'])
 def refresh_token():
