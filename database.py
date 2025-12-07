@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 import secrets
 from werkzeug.security import generate_password_hash  # для тестовых пользователей
-
+TOKEN_TTL_MINUTES = 120
 DATABASE = 'task_manager.db'
 
 # ===== СОЗДАНИЕ ТАБЛИЦ =====
@@ -20,7 +20,7 @@ def init_db():
         email TEXT UNIQUE NOT NULL,
         username TEXT NOT NULL,
         password_hash TEXT NOT NULL,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        created_at TEXT DEFAULT (DATETIME('now','localtime')),
         role TEXT DEFAULT 'user' CHECK(role IN ('user', 'admin', 'super_admin'))
     )
     ''')
@@ -38,8 +38,8 @@ def init_db():
         due_date TEXT,
         author_id INTEGER NOT NULL,
         executor_id INTEGER,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        created_at TEXT DEFAULT (DATETIME('now','localtime')),
+        updated_at TEXT DEFAULT (DATETIME('now','localtime')),
         FOREIGN KEY (author_id) REFERENCES users(id),
         FOREIGN KEY (executor_id) REFERENCES users(id)
     )
@@ -52,7 +52,7 @@ def init_db():
         task_id INTEGER NOT NULL,
         author_id INTEGER NOT NULL,
         text TEXT NOT NULL,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        created_at TEXT DEFAULT (DATETIME('now','localtime')),
         FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
         FOREIGN KEY (author_id) REFERENCES users(id)
     )
@@ -64,7 +64,7 @@ def init_db():
         token TEXT PRIMARY KEY,
         user_id INTEGER NOT NULL,
         expires_at TEXT NOT NULL,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        created_at TEXT DEFAULT (DATETIME('now','localtime')),
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     )
     ''')
@@ -161,47 +161,43 @@ def create_user(email, username, password_hash, role='user'):
         except sqlite3.IntegrityError:
             return None
 
-def get_user_by_access_token(token: str):
-    """
-    Вернуть пользователя по access-токену из таблицы auth_tokens.
-    """
+def get_user_by_access_token(token):
     with get_db() as cursor:
-        cursor.execute('''
-            SELECT 
-                u.id,
-                u.email,
-                u.username,
-                u.created_at,
-                u.role,
-                t.expires_at
-            FROM auth_tokens t
-            JOIN users u ON u.id = t.user_id
-            WHERE t.token = ?
-        ''', (token,))
+        cursor.execute(
+            """
+            SELECT u.*, a.expires_at
+            FROM auth_tokens a
+            JOIN users u ON a.user_id = u.id
+            WHERE a.token = ?
+            """,
+            (token,),
+        )
         row = cursor.fetchone()
         if not row:
             return None
 
-        data = dict_from_row(row)
+        expires_at = datetime.strptime(row["expires_at"], "%Y-%m-%d %H:%M:%S")
+        if _now_utc() > expires_at:
+            # токен истёк — удаляем и считаем недействительным
+            cursor.execute("DELETE FROM auth_tokens WHERE token = ?", (token,))
+            return None
 
-        # проверка срока действия токена
-        expires_at = data.get("expires_at")
-        if expires_at:
-            try:
-                if datetime.fromisoformat(expires_at) <= datetime.utcnow():
-                    return None
-            except Exception:
-                # если формат неожиданно странный — не роняем сервер
-                pass
+        return dict_from_row(row)
 
-        # нам от токена нужен только пользователь
-        return {
-            "id": data["id"],
-            "email": data["email"],
-            "username": data["username"],
-            "created_at": data["created_at"],
-            "role": data["role"],
-        }
+
+def delete_access_token(token: str) -> bool:
+    """Удаляет конкретный токен."""
+    with get_db() as cursor:
+        cursor.execute("DELETE FROM auth_tokens WHERE token = ?", (token,))
+        return cursor.rowcount > 0
+
+
+def delete_all_tokens_for_user(user_id: int) -> int:
+    """На всякий случай: удалить все токены пользователя (массовый логаут)."""
+    with get_db() as cursor:
+        cursor.execute("DELETE FROM auth_tokens WHERE user_id = ?", (user_id,))
+        return cursor.rowcount
+
 
 
 
@@ -306,7 +302,9 @@ def update_task(task_id, **kwargs):
     
     with get_db() as cursor:
         cursor.execute(
-            f"UPDATE tasks SET {', '.join(updates)}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            f"UPDATE tasks SET {', '.join(updates)}, "
+            "updated_at = DATETIME('now','localtime') "
+            "WHERE id = ?",
             params
         )
         return cursor.rowcount > 0
@@ -469,18 +467,27 @@ def add_test_data():
         print("✅ Тестовые данные добавлены")
 
 # ===== ФУНКЦИИ ДЛЯ ТОКЕНОВ АВТОРИЗАЦИИ =====
+def _now_utc():
+    return datetime.utcnow()
 
-def create_token(user_id: int, expires_in: int = 3600) -> str:
-    """Создать новый токен авторизации для пользователя."""
+def create_auth_token(user_id):
     token = secrets.token_urlsafe(32)
-    expires_at = (datetime.utcnow() + timedelta(seconds=expires_in)).strftime("%Y-%m-%d %H:%M:%S")
+    now = _now_utc()
+    expires_at = now + timedelta(minutes=TOKEN_TTL_MINUTES)
 
     with get_db() as cursor:
         cursor.execute(
-            "INSERT INTO auth_tokens (token, user_id, expires_at) VALUES (?, ?, ?)",
-            (token, user_id, expires_at)
+            """
+            INSERT INTO auth_tokens (token, user_id, expires_at, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                token,
+                user_id,
+                expires_at.strftime("%Y-%m-%d %H:%M:%S"),
+                now.strftime("%Y-%m-%d %H:%M:%S"),
+            ),
         )
-
     return token
 
 

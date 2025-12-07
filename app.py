@@ -529,7 +529,7 @@ def login():
         "role": user["role"],
     }
 
-    access_token = database.create_token(user["id"])
+    access_token = database.create_auth_token(user["id"])
 
     return jsonify({
         "success": True,
@@ -538,7 +538,15 @@ def login():
         "token": access_token
     }), 200
 
+@app.route('/auth/logout', methods=['POST'])
+@token_required
+def logout():
+    token = getattr(g, "current_token", None)
+    if not token:
+        return jsonify({"success": True, "message": "Уже разлогинен"}), 200
 
+    database.delete_access_token(token)
+    return jsonify({"success": True, "message": "Выход выполнен"}), 200
     
 
 @app.route('/auth/register', methods=['POST'])
@@ -614,21 +622,56 @@ def get_current_user():
     }), 200
 
 def resolve_current_user():
-    """Достаём юзера по токену из заголовка Authorization."""
+    """Достаём пользователя из заголовка Authorization: Bearer <token>"""
     auth_header = request.headers.get("Authorization", "")
-    
     if not auth_header.startswith("Bearer "):
-        return None, ("Требуется авторизация", 401)
-    
+        # нет заголовка — гость
+        return None, None
+
     token = auth_header.split(" ", 1)[1].strip()
     if not token:
-        return None, ("Требуется авторизация", 401)
-    
+        return None, (jsonify({"error": "Некорректный токен"}), 401)
+
     user = database.get_user_by_access_token(token)
     if not user:
-        return None, ("Неверный или истёкший токен", 401)
-    
+        return None, (jsonify({"error": "Требуется авторизация"}), 401)
+
+    # Кладём в g, чтобы все хендлеры могли пользоваться
+    g.current_user = user
+    g.current_token = token
     return user, None
+
+def auth_required(fn):
+    """Декоратор: нужен авторизованный пользователь."""
+    from functools import wraps
+
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        user, error = resolve_current_user()
+        if error is not None:
+            # error уже (Response, code) — просто возвращаем
+            return error
+        if user is None:
+            return jsonify({"error": "Требуется авторизация"}), 401
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def admin_required(fn):
+    """Декоратор: нужен admin или super_admin."""
+    from functools import wraps
+
+    @wraps(fn)
+    @auth_required
+    def wrapper(*args, **kwargs):
+        user = g.current_user
+        if user["role"] not in ("admin", "super_admin"):
+            return jsonify({"error": "Недостаточно прав"}), 403
+        return fn(*args, **kwargs)
+
+    return wrapper
+
 
 def login_required(f):
     @wraps(f)
