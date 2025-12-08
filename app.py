@@ -15,8 +15,10 @@ from cache import (
     invalidate_task_list_cache,
     invalidate_task_detail,
 )
+from flask_socketio import SocketIO
 
 app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*")
 app.config["SECRET_KEY"] = "very-secret-key-change-me" 
 app.config["JSON_AS_ASCII"] = False  # чтобы JSON отдавался с нормальной кириллицей
 
@@ -191,6 +193,44 @@ def get_tasks():
         "tasks": data_for_cache["tasks"],
     })
 
+# ==== WebSocket / Socket.IO уведомления ====
+
+def broadcast_task_event(event_type: str, task: dict | None = None, task_id: int | None = None):
+    """
+    Рассылаем событие про задачу всем подключённым клиентам.
+    event_type: 'created' | 'updated' | 'deleted'
+    """
+    payload = {"type": event_type}
+    if task is not None:
+        payload["task"] = task
+    if task_id is not None:
+        payload["task_id"] = task_id
+
+    # БЕЗ broadcast=...
+    socketio.emit("task_event", payload)
+
+
+def broadcast_comment_event(
+    event_type: str,
+    comment: dict | None = None,
+    task_id: int | None = None,
+    comment_id: int | None = None
+):
+    """
+    Рассылаем событие про комментарий.
+    event_type: 'created' | 'updated' | 'deleted'
+    """
+    payload = {"type": event_type}
+    if comment is not None:
+        payload["comment"] = comment
+    if task_id is not None:
+        payload["task_id"] = task_id
+    if comment_id is not None:
+        payload["comment_id"] = comment_id
+
+    socketio.emit("comment_event", payload)
+
+
 
 @app.route('/api/tasks/<int:task_id>', methods=['GET'])
 def get_task(task_id):
@@ -252,6 +292,7 @@ def create_task():
 
         # Получаем её в "расширенном" виде (c author_name, executor_name)
         task = database.get_task_by_id(task_id)
+        broadcast_task_event("created", task=task)  
         if not task:
             return jsonify({"error": "Не удалось получить задачу после создания"}), 500
 
@@ -334,6 +375,7 @@ def update_task(task_id):
     invalidate_task_detail(task_id)
 
     updated_task = database.get_task_by_id(task_id)
+    broadcast_task_event("updated", task=updated_task)
 
     return jsonify({
         "success": True,
@@ -382,6 +424,7 @@ def delete_task(task_id):
         if affected:
             invalidate_task_list_cache()
             invalidate_task_detail(task_id)
+            broadcast_task_event("deleted", task_id=task_id)
 
         return jsonify({
             "success": True,
@@ -439,6 +482,8 @@ def add_comment_to_task(task_id):
 
         # Добавляем комментарий в БД
         comment_id = database.add_comment(task_id=task_id, author_id=author_id, text=text)
+        new_comment = database.get_comment_by_id(comment_id)
+        broadcast_comment_event("created", comment=new_comment, task_id=task_id)    
 
         return jsonify({
             "success": True,
@@ -460,22 +505,29 @@ def add_comment_to_task(task_id):
 def delete_comment(comment_id):
     """Удалить комментарий"""
     try:
-        import sqlite3
         conn = sqlite3.connect('task_manager.db')
         cursor = conn.cursor()
 
         # Проверяем существует ли комментарий
         cursor.execute("SELECT id FROM comments WHERE id = ?", (comment_id,))
-        if not cursor.fetchone():
+        row = cursor.fetchone()
+        if not row:
             conn.close()
             return jsonify({"error": "Комментарий не найден"}), 404
 
-        # Удаляем
+        task_id = row[0]
+
         cursor.execute("DELETE FROM comments WHERE id = ?", (comment_id,))
         conn.commit()
-
         affected = cursor.rowcount
         conn.close()
+        if affected:
+            # уведомляем фронт
+            broadcast_comment_event(
+                "deleted",
+                task_id=task_id,
+                comment_id=comment_id
+            )
 
         return jsonify({
             "success": True,
@@ -530,6 +582,7 @@ def update_comment_route(comment_id):
         return jsonify({"error": "Не удалось обновить комментарий"}), 500
 
     updated = database.get_comment_by_id(comment_id)
+    broadcast_comment_event("updated", comment=updated, task_id=updated["task_id"])
 
     return jsonify({
         "success": True,
@@ -952,4 +1005,4 @@ def print_banner():
 # ===== ЗАПУСК СЕРВЕРА =====
 if __name__ == '__main__':
     print_banner()
-    app.run(debug=True, port=5000)
+    socketio.run(app, host="0.0.0.0", port=5000, debug=True)

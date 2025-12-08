@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <title>Task Manager — Админ-панель</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
   <style>
     :root {
       --bg: #0f172a;
@@ -2150,6 +2151,55 @@ function togglePassword(input, btn) {
   }
 }
 
+let socket = null;
+
+function initSocket() {
+  if (typeof io === "undefined") {
+    console.warn("Socket.IO не загружен, realtime работать не будет");
+    return;
+  }
+
+  socket = io();
+
+  socket.on("connect", () => {
+    console.log("[WS] connected:", socket.id);
+  });
+
+  socket.on("disconnect", () => {
+    console.log("[WS] disconnected");
+  });
+
+  // события по задачам
+  socket.on("task_event", (payload) => {
+    console.log("[WS] task_event", payload);
+    const type = payload.type;
+    const t = payload.task;
+
+    if (type === "created" && t) {
+      showSuccess(`Новая задача #${t.id}: ${t.title}`);
+    } else if (type === "updated") {
+      const id = (t && t.id) || payload.task_id;
+      showSuccess(`Задача #${id} обновлена`);
+    } else if (type === "deleted") {
+      showSuccess(`Задача #${payload.task_id} удалена`);
+    }
+
+    // обновляем таблицу и статистику
+    loadTasks();
+    loadStatsAndUsers();
+  });
+
+  // события по комментариям
+  socket.on("comment_event", (payload) => {
+    console.log("[WS] comment_event", payload);
+
+    // если сейчас открыта та же задача — обновим комментарии
+    if (payload.task_id && payload.task_id === selectedTaskId) {
+      loadComments(selectedTaskId);
+    }
+  });
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   const loginForm = document.getElementById("login-form");
   if (loginForm) {
@@ -2211,6 +2261,7 @@ document.addEventListener("DOMContentLoaded", () => {
   initTabs();
   initPasswordToggles();
   loadMeAndInit();
+  initSocket();
 });
 </script>
 
