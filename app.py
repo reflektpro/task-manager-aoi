@@ -64,25 +64,39 @@ def token_required(f):
 def home():
     payload = {
         "project": "Task Manager API",
-        "version": "1.0",
+        "version": "1.3",
+        "description": "REST API для управления задачами с ролями пользователей и админ-панелью.",
         "endpoints": {
+            "auth": {
+                "POST /auth/register": "Регистрация пользователя (user/admin; super_admin только через БД)",
+                "POST /auth/login": "Авторизация, возвращает token",
+                "POST /auth/refresh": "Обновление токена (refresh → новый access)",
+                "POST /auth/logout": "Выход, инвалидация текущего токена"
+            },
             "users": {
-                "GET /api/users": "Все пользователи",
-                "GET /api/users/<id>": "Пользователь по ID"
+                "GET /api/users": "Список пользователей (для отладки)",
+                "GET /api/users/<id>": "Пользователь по ID",
+                "GET /users/me": "Профиль текущего пользователя (по токену)",
+                "PUT /users/me": "Обновление текущего пользователя (без пароля)"
             },
             "tasks": {
-                "GET /api/tasks": "Все задачи (с фильтрами)",
-                "GET /api/tasks/<id>": "Задача по ID",
-                "POST /api/tasks": "Создать задачу",
-                "PUT /api/tasks/<id>": "Обновить задачу",
+                "GET /api/tasks": "Список задач (фильтры: status, priority, author_id, executor_id, limit, offset)",
+                "GET /api/tasks/<id>": "Детали задачи",
+                "POST /api/tasks": "Создание задачи (роль admin или super_admin)",
+                "PUT /api/tasks/<id>": "Обновление задачи (admin — только свои, super_admin — любые)",
+                "DELETE /api/tasks/<id>": "Удаление задачи (admin — только свои, super_admin — любые)"
             },
             "comments": {
                 "GET /api/tasks/<id>/comments": "Комментарии к задаче",
-                "POST /api/tasks/<id>/comments": "Добавить комментарий"
+                "POST /api/tasks/<id>/comments": "Добавить комментарий (любой авторизованный пользователь)",
+                "PUT /api/comments/<id>": "Обновить комментарий (автор, admin, super_admin)",
+                "DELETE /api/comments/<id>": "Удалить комментарий (автор, admin, super_admin)"
             },
-            "auth": {
-                "POST /auth/register": "Регистрация нового пользователя",
-                "POST /auth/login": "Авторизация (возвращает токен-заглушку)"
+            "admin_panel": {
+                "GET /admin": "HTML админ-панель (логин, задачи, пользователи, статистика)",
+                "GET /admin/stats": "JSON статистика (задачи по статусам, активность пользователей)",
+                "PUT /admin/users/<id>/role": "Изменение роли пользователя (только super_admin)",
+                "DELETE /admin/users/<id>": "Удаление пользователя (только super_admin)"
             }
         }
     }
@@ -888,25 +902,54 @@ def refresh_token():
     }), 200
 
 
+# ======= БАНЕР =====================
+def print_banner():
+    line = "=" * 80
+    print(line)
+    print("TASK MANAGER API".center(80))
+    print(line)
+    print("Базовый URL: http://localhost:5000")
+    print()
+
+    print("Аутентификация:")
+    print("  POST /auth/register          - регистрация пользователя")
+    print("  POST /auth/login             - логин, выдаёт токен")
+    print("  POST /auth/refresh           - обновление токена")
+    print("  POST /auth/logout            - выход, токен становится невалиден")
+    print()
+
+    print("Пользователи:")
+    print("  GET  /api/users              - список пользователей (отладка)")
+    print("  GET  /api/users/<id>         - пользователь по ID")
+    print("  GET  /users/me               - профиль текущего пользователя")
+    print("  PUT  /users/me               - обновление текущего пользователя")
+    print()
+
+    print("Задачи:")
+    print("  GET    /api/tasks            - список задач (фильтры: status, priority, author_id, executor_id)")
+    print("  GET    /api/tasks/<id>       - детали задачи")
+    print("  POST   /api/tasks            - создать задачу (admin / super_admin)")
+    print("  PUT    /api/tasks/<id>       - обновить задачу (admin свои, super_admin любые)")
+    print("  DELETE /api/tasks/<id>       - удалить задачу (admin свои, super_admin любые)")
+    print()
+
+    print("Комментарии:")
+    print("  GET    /api/tasks/<id>/comments   - комментарии к задаче")
+    print("  POST   /api/tasks/<id>/comments   - добавить комментарий")
+    print("  PUT    /api/comments/<id>         - обновить комментарий")
+    print("  DELETE /api/comments/<id>         - удалить комментарий")
+    print()
+
+    print("Админ-панель:")
+    print("  GET  /admin                  - HTML панель (логин, задачи, пользователи, статистика)")
+    print("  GET  /admin/stats            - JSON статистика")
+    print("  PUT  /admin/users/<id>/role  - смена роли пользователя (super_admin)")
+    print("  DELETE /admin/users/<id>     - удалить пользователя (super_admin)")
+    print(line)
+
+
 
 # ===== ЗАПУСК СЕРВЕРА =====
 if __name__ == '__main__':
-    print("=" * 70)
-    print("TASK MANAGER API")
-    print("=" * 70)
-    print("Сервер запущен: http://localhost:5000")
-    print("\nДоступные endpoints:")
-    print("\nПользователи:")
-    print("  GET  /api/users          - все пользователи")
-    print("  GET  /api/users/<id>     - пользователь по ID")
-    print("\nЗадачи:")
-    print("  GET  /api/tasks          - все задачи (с фильтрами)")
-    print("  GET  /api/tasks/<id>     - задача по ID")
-    print("  POST /api/tasks          - создать задачу (JSON в теле)")
-    print("  PUT  /api/tasks/<id>     - обновить задачу")
-    print("\nКомментарии:")
-    print("  GET  /api/tasks/<id>/comments  - комментарии к задаче")
-    print("  POST /api/tasks/<id>/comments  - добавить комментарий")
-    print("=" * 70)
-    
+    print_banner()
     app.run(debug=True, port=5000)

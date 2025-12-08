@@ -1,0 +1,10 @@
+{
+  "token": "G4F8Xk8vsXqOfs0Sfa9sTEYGXIMKcHfonTsetZWMz18",
+  "user": {
+    "email": "admin@mail.ru",
+    "id": 2,
+    "role": "admin",
+    "username": "Администратор"
+  },
+  "base_url": "http://localhost:5000"
+}
