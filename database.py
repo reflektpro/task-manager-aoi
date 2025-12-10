@@ -3,14 +3,15 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 import secrets
-from werkzeug.security import generate_password_hash  # для тестовых пользователей
+from werkzeug.security import generate_password_hash # для тестовых пользователей
+from typing import List, Optional, Dict, Any  
 TOKEN_TTL_MINUTES = 120
-DATABASE = 'task_manager.db'
+DB_NAME = 'task_manager.db'
 
 # ===== СОЗДАНИЕ ТАБЛИЦ =====
 def init_db():
     """Создаёт все таблицы если их нет"""
-    conn = sqlite3.connect(DATABASE)
+    conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
     # Таблица пользователей
@@ -68,16 +69,31 @@ def init_db():
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     )
     ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS task_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL,
+            original_name TEXT NOT NULL,
+            stored_name TEXT NOT NULL,
+            content_type TEXT,
+            size_bytes INTEGER,
+            uploaded_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            uploader_id INTEGER,
+            FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+            FOREIGN KEY (uploader_id) REFERENCES users(id) ON DELETE SET NULL
+        )
+    ''')
     
     conn.commit()
     conn.close()
-    print(f"✅ База данных создана: {DATABASE}")
+    print(f"✅ База данных создана: {DB_NAME}")
 
 # ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
 @contextmanager
 def get_db():
     """Контекстный менеджер для работы с БД"""
-    conn = sqlite3.connect(DATABASE)
+    conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row  # Возвращает словари вместо кортежей
     try:
         yield conn.cursor()
@@ -427,7 +443,98 @@ def get_active_users(limit: int = 10):
         """, (limit,))
         return [dict_from_row(row) for row in cursor.fetchall()]
 
+# ===== ФУНКЦИИ ДЛЯ ATTACHMENT ========
+def create_attachment(task_id, uploader_id, filename_orig,
+                      filename_stored, mime_type=None, size_bytes=None):
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
 
+    cursor.execute("""
+        INSERT INTO attachments (
+            task_id, uploader_id, filename_orig,
+            filename_stored, mime_type, size_bytes
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (task_id, uploader_id, filename_orig,
+          filename_stored, mime_type, size_bytes))
+
+    attachment_id = cursor.lastrowid
+    conn.commit()
+
+    cursor.execute("SELECT * FROM attachments WHERE id = ?", (attachment_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    return dict(row)
+
+def get_attachments_for_task(task_id: int) -> list[dict]:
+    """
+    Все файлы, прикреплённые к задаче.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            id,
+            task_id,
+            stored_name,
+            original_name,
+            content_type,
+            size_bytes,
+            uploaded_by,
+            uploaded_at
+        FROM task_files
+        WHERE task_id = ?
+        ORDER BY id DESC
+        """,
+        (task_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_attachment_by_id(attachment_id: int) -> dict | None:
+    """
+    Один файл по ID.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            id,
+            task_id,
+            stored_name,
+            original_name,
+            content_type,
+            size_bytes,
+            uploaded_by,
+            uploaded_at
+        FROM task_files
+        WHERE id = ?
+        """,
+        (attachment_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def delete_attachment(attachment_id: int) -> bool:
+    """
+    Удалить запись о файле (сам файл на диске удаляется в app.py).
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM task_files WHERE id = ?", (attachment_id,))
+    conn.commit()
+    deleted = cur.rowcount
+    conn.close()
+    return deleted > 0
 
 
 # ===== ИНИЦИАЛИЗАЦИЯ =====
@@ -551,6 +658,147 @@ def refresh_token(old_token: str, expires_in: int = 3600):
         )
 
         return new_token
+    
+# ====== ФАЙЛЫ ===========
+def get_connection():
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def save_task_file(task_id: int,
+                   stored_name: str,
+                   original_name: str,
+                   content_type: str | None,
+                   size_bytes: int,
+                   uploaded_by: int | None = None) -> dict | None:
+    """
+    Сохранить информацию о файле задачи в таблице task_files.
+    Возвращает dict с полями файла.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO task_files (
+            task_id,
+            stored_name,
+            original_name,
+            content_type,
+            size_bytes,
+            uploaded_by
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (task_id, stored_name, original_name, content_type, size_bytes, uploaded_by),
+    )
+    attachment_id = cur.lastrowid
+    conn.commit()
+
+    cur.execute(
+        """
+        SELECT
+            id,
+            task_id,
+            stored_name,
+            original_name,
+            content_type,
+            size_bytes,
+            uploaded_by,
+            uploaded_at
+        FROM task_files
+        WHERE id = ?
+        """,
+        (attachment_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_task_files_for_task(task_id: int) -> list[dict]:
+    """
+    Список файлов, прикреплённых к конкретной задаче.
+    """
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute(
+        '''
+        SELECT
+            tf.id,
+            tf.task_id,
+            tf.original_name,
+            tf.stored_name,
+            tf.content_type,
+            tf.size_bytes,
+            tf.uploaded_at,
+            tf.uploader_id,
+            u.username AS uploader_name
+        FROM task_files tf
+        LEFT JOIN users u ON tf.uploader_id = u.id
+        WHERE tf.task_id = ?
+        ORDER BY tf.uploaded_at DESC, tf.id DESC
+        ''',
+        (task_id,)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_task_file(file_id: int) -> Optional[dict]:
+    """
+    Получить один файл по id.
+    """
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute(
+        '''
+        SELECT
+            tf.id,
+            tf.task_id,
+            tf.original_name,
+            tf.stored_name,
+            tf.content_type,
+            tf.size_bytes,
+            tf.uploaded_at,
+            tf.uploader_id,
+            u.username AS uploader_name
+        FROM task_files tf
+        LEFT JOIN users u ON tf.uploader_id = u.id
+        WHERE tf.id = ?
+        ''',
+        (file_id,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def delete_task_file(file_id: int) -> bool:
+    """
+    Удалить запись о файле. Возвращает True, если что-то было удалено.
+    (сам физический файл должен удаляться во Flask-обработчике)
+    """
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM task_files WHERE id = ?', (file_id,))
+    conn.commit()
+    affected = cursor.rowcount
+    conn.close()
+    return affected > 0
+
+
+# Алиасы на всякий случай, если во view мы используем другие имена
+def get_task_files(task_id: int) -> list[dict]:
+    """Алиас для get_task_files_for_task."""
+    return get_task_files_for_task(task_id)
+
+
+def get_task_file_by_id(file_id: int) -> Optional[dict]:
+    """Алиас для get_task_file."""
+    return get_task_file(file_id)
 
 
 # При импорте инициализируем БД

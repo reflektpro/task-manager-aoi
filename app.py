@@ -1,5 +1,5 @@
 # app.py
-from flask import Flask, request, jsonify, Response, g, render_template
+from flask import Flask, request, jsonify, Response, g, render_template,send_from_directory
 import json
 import database
 from utils.validators import validate_email, validate_username, validate_task_data
@@ -16,9 +16,26 @@ from cache import (
     invalidate_task_detail,
 )
 from flask_socketio import SocketIO
+import os
+import uuid
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB
+
+ALLOWED_EXTENSIONS = {
+    "png", "jpg", "jpeg", "gif",
+    "pdf", "txt", "doc", "docx",
+    "xls", "xlsx", "zip", "rar"
+}
+def allowed_file(filename: str) -> bool:
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 app.config["SECRET_KEY"] = "very-secret-key-change-me" 
 app.config["JSON_AS_ASCII"] = False  # чтобы JSON отдавался с нормальной кириллицей
 
@@ -837,6 +854,153 @@ def update_current_user():
             "username": new_username
         }
     }), 200
+
+# ===== ОБРАБОТКА ФАЙЛОВ =====
+@app.route("/api/tasks/<int:task_id>/files", methods=["GET"])
+def list_task_files(task_id):
+    """Список вложений для задачи"""
+    task = database.get_task_by_id(task_id)
+    if not task:
+        return jsonify({"error": "Задача не найдена"}), 404
+
+    attachments = database.get_attachments_for_task(task_id)
+    return jsonify({
+        "success": True,
+        "files": attachments
+    })
+
+@app.route('/api/tasks/<int:task_id>/files', methods=['POST'])
+@token_required
+def upload_task_files(task_id):
+    """
+    Загрузка одного или нескольких файлов к задаче.
+    Поле формы: files (может быть несколько).
+    """
+    current_user = g.current_user  
+    task = database.get_task_by_id(task_id)
+    if not task:
+        return jsonify({"error": "Задача не найдена"}), 404
+    if current_user["role"] not in ("admin", "super_admin"):
+        return jsonify({"error": "Недостаточно прав для загрузки файлов"}), 403
+    if "files" not in request.files:
+        return jsonify({"error": "Ожидается поле 'files' в multipart-форме"}), 400
+
+    files = request.files.getlist("files")
+    if not files:
+        return jsonify({"error": "Файлы не переданы"}), 400
+    upload_dir = os.path.join(app.root_path, "uploads")
+    os.makedirs(upload_dir, exist_ok=True)
+
+    saved_files = []
+
+    for file_storage in files:
+        if not file_storage or file_storage.filename == "":
+            continue
+
+        original_name = secure_filename(file_storage.filename)
+        if not original_name:
+            continue
+
+        _, ext = os.path.splitext(original_name)
+        stored_name = f"{uuid.uuid4().hex}{ext}"
+        disk_path = os.path.join(upload_dir, stored_name)
+
+        file_storage.stream.seek(0, os.SEEK_END)
+        size_bytes = file_storage.stream.tell()
+        file_storage.stream.seek(0)
+
+        file_storage.save(disk_path)
+
+        file_id = database.save_task_file(
+            task_id=task_id,
+            original_name=original_name,
+            stored_name=stored_name,
+            content_type=file_storage.mimetype,
+            size_bytes=size_bytes,
+            uploader_id=current_user["id"],
+        )
+
+        saved_files.append(
+            {
+                "id": file_id,
+                "task_id": task_id,
+                "original_name": original_name,
+                "stored_name": stored_name,
+                "content_type": file_storage.mimetype,
+                "size_bytes": size_bytes,
+            }
+        )
+
+    if not saved_files:
+        return jsonify({"error": "Не удалось сохранить ни один файл"}), 400
+
+    return jsonify(
+        {
+            "success": True,
+            "message": f"Загружено файлов: {len(saved_files)}",
+            "files": saved_files,
+        }
+    ), 201
+
+
+@app.route("/api/files/<int:attachment_id>/download", methods=["GET"])
+def download_attachment(attachment_id):
+    """Скачать файл-вложение"""
+    attachment = database.get_attachment_by_id(attachment_id)
+    if not attachment:
+        return jsonify({"error": "Файл не найден"}), 404
+
+    stored_name = attachment["filename_stored"]
+    original_name = attachment["filename_orig"]
+    directory = app.config["UPLOAD_FOLDER"]
+
+    file_path = os.path.join(directory, stored_name)
+    if not os.path.exists(file_path):
+        return jsonify({"error": "Файл отсутствует на диске"}), 404
+
+    return send_from_directory(
+        directory,
+        stored_name,
+        as_attachment=True,
+        download_name=original_name,
+    )
+
+@app.route("/api/files/<int:attachment_id>", methods=["DELETE"])
+@token_required
+def delete_attachment(attachment_id):
+    user = g.current_user
+    """Удалить вложение"""
+    attachment = database.get_attachment_by_id(attachment_id)
+    if not attachment:
+        return jsonify({"error": "Файл не найден"}), 404
+
+    # Проверка прав
+    role = user.get("role")
+    is_owner = user["id"] == attachment["uploader_id"]
+    is_admin = role in ("admin", "super_admin")
+
+    if not (is_owner or is_admin):
+        return jsonify({"error": "Недостаточно прав для удаления файла"}), 403
+
+    stored_name = attachment["filename_stored"]
+    file_path = os.path.join(app.config["UPLOAD_FOLDER"], stored_name)
+
+    ok = database.delete_attachment(attachment_id)
+    if not ok:
+        return jsonify({"error": "Не удалось удалить запись о файле"}), 400
+
+    # Пытаемся удалить сам файл с диска
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+    except OSError:
+        # в крайнем случае просто пишем в лог, но ошибкой не считаем
+        print(f"⚠ Не удалось удалить файл с диска: {file_path}", flush=True)
+
+    return jsonify({
+        "success": True,
+        "message": f"Файл #{attachment_id} удалён"
+    })
 
 # ===== АДМИН: УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ =====
 

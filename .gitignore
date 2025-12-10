@@ -28,3 +28,8 @@ env/
 # Системные файлы
 .DS_Store
 Thumbs.db
+
+/uploads
+test_downloaded.txt 
+test.txt
+
