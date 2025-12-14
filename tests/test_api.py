@@ -129,26 +129,26 @@ def test_create_task_validation_error(client, auth_token):
 
 
 
-def test_task_lifecycle(client, auth_token):
+def test_task_lifecycle(client, auth_token_admin):
     """
     Полный цикл: создать → получить → обновить → удалить
     """
     # 1. Создаём задачу (нужен токен администратора)
     payload = {
         "title": "Жизненный цикл задачи",
-        "author_id": 1,
+        "author_id": 1,  # Или другого ID, если требуется
     }
     resp = client.post(
         "/api/tasks",
         json=payload,
-        headers={"Authorization": f"Bearer {auth_token}"}
+        headers={"Authorization": f"Bearer {auth_token_admin}"}  # Токен для администратора
     )
     assert resp.status_code == 201
     data = resp.get_json()
     task_id = data["task"]["id"]
 
     # 2. Получаем задачу по ID
-    resp_get = client.get(f"/api/tasks/{task_id}")
+    resp_get = client.get(f"/api/tasks/{task_id}", headers={"Authorization": f"Bearer {auth_token_admin}"})
     assert resp_get.status_code == 200
     data_get = resp_get.get_json()
     assert data_get["task"]["id"] == task_id
@@ -156,17 +156,19 @@ def test_task_lifecycle(client, auth_token):
     # 3. Обновляем статус задачи
     resp_put = client.put(
         f"/api/tasks/{task_id}",
-        json={"status": "в процессе"}
+        json={"status": "в процессе"},
+        headers={"Authorization": f"Bearer {auth_token_admin}"}  # Токен администратора
     )
     assert resp_put.status_code == 200
     data_put = resp_put.get_json()
     assert data_put["task"]["status"] == "в процессе"
 
     # 4. Удаляем задачу
-    resp_del = client.delete(f"/api/tasks/{task_id}")
+    resp_del = client.delete(f"/api/tasks/{task_id}", headers={"Authorization": f"Bearer {auth_token_admin}"})
     assert resp_del.status_code == 200
     data_del = resp_del.get_json()
     assert data_del["success"] is True
+
 
 
 
